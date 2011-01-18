@@ -93,6 +93,9 @@ void acx_cmd_join_bssid(acx_device_t *adev, const u8 *bssid);
 
 // Configuration (Control Path)
 void acx_set_defaults(acx_device_t * adev);
+static void acx_get_sensitivity(acx_device_t *adev);
+static void acx_set_sensitivity(acx_device_t *adev, u8 sensitivity);
+static void acx_update_sensitivity(acx_device_t *adev);
 void acx_update_card_settings(acx_device_t *adev);
 void acx_start(acx_device_t * adev);
 int acx_net_reset(struct ieee80211_hw *ieee);
@@ -128,6 +131,8 @@ static int acx_s_set_null_data_template(acx_device_t * adev);
 #endif
 
 // Recalibration (Control Path)
+static int acx111_set_recalib_auto(acx_device_t *adev, int enable);
+static int acx111_update_recalib_auto(acx_device_t *adev);
 static int acx_recalib_radio(acx_device_t *adev);
 static void acx_after_interrupt_recalib(acx_device_t * adev);
 
@@ -153,10 +158,12 @@ static int acx_proc_show_eeprom(struct seq_file *file, void *v);
 static int acx_proc_show_phy(struct seq_file *file, void *v);
 static int acx_proc_show_debug(struct seq_file *file, void *v);
 static ssize_t acx_proc_write_debug(struct file *file, const char __user *buf, size_t count, loff_t *ppos);
+static int acx_proc_show_sensitivity(struct seq_file *file, void *v);
+static ssize_t acx_proc_write_sensitivity(struct file *file, const char __user *buf, size_t count, loff_t *ppos);
 static int acx_proc_open(struct inode *inode, struct file *file);
-static int acx_proc_manage_entries(struct ieee80211_hw *hw, int num, int remove);
-int acx_proc_register_entries(struct ieee80211_hw *ieee, int num);
-int acx_proc_unregister_entries(struct ieee80211_hw *ieee, int num);
+static void acx_proc_init(void);
+int acx_proc_register_entries(struct ieee80211_hw *ieee);
+int acx_proc_unregister_entries(struct ieee80211_hw *ieee);
 #endif
 
 // Rx Path
@@ -178,6 +185,10 @@ static void acx_dealloc_tx(acx_device_t *adev, tx_t *tx_opaque);
 static void *acx_get_txbuf(acx_device_t *adev, tx_t *tx_opaque);
 static void acx_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
 void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger, struct ieee80211_tx_info *info);
+u16 acx111_tx_build_rateset(acx_device_t *adev, txdesc_t *txdesc, struct ieee80211_tx_info *info);
+void acx111_tx_build_txstatus(acx_device_t *adev,	struct ieee80211_tx_info *txstatus, u16 r111, u8 ack_failures);
+u16 acx_rate111_hwvalue_to_bitrate(u16 hw_value);
+int acx_rate111_hwvalue_to_rateindex(u16 hw_value);
 
 // Crypto
 static void acx100_set_wepkey(acx_device_t * adev);
@@ -527,11 +538,40 @@ const u8 acx_bitpos2rate100[] = {
 	RATE100_2,		/* 15, should not happen */
 };
 
+int acx_rate111_hwvalue_to_rateindex(u16 hw_value)
+{
+	int i;
+	int r=-1;
+
+	for (i = 0; i < ARRAY_SIZE(acx111_rates); i++)
+	{
+		if (acx111_rates[i].hw_value == hw_value)
+		{
+			r = i;
+			break;
+		}
+	}
+
+	return (r);
+}
+
+u16 acx_rate111_hwvalue_to_bitrate(u16 hw_value)
+{
+	int i;
+	u16 bitrate = -1;
+
+	i = acx_rate111_hwvalue_to_rateindex(hw_value);
+	if (i != -1)
+		bitrate = acx111_rates[i].bitrate;
+
+	return (bitrate);
+}
+
 // Proc
 #ifdef CONFIG_PROC_FS
 
 static const char *const
- proc_files[] = { "acx", "acx_diag", "acx_eeprom", "acx_phy", "acx_debug" };
+ proc_files[] = { "info", "diag", "eeprom", "phy", "debug", "sensitivity" };
 
 typedef int acx_proc_show_t(struct seq_file *file, void *v);
 typedef ssize_t (acx_proc_write_t)(struct file *, const char __user *, size_t, loff_t *);
@@ -543,6 +583,7 @@ static acx_proc_show_t *const
 	acx_proc_show_eeprom,
 	acx_proc_show_phy,
 	acx_proc_show_debug,
+	acx_proc_show_sensitivity,
 };
 
 static acx_proc_write_t *const
@@ -552,9 +593,11 @@ static acx_proc_write_t *const
 	NULL,
 	NULL,
 	acx_proc_write_debug,
+	acx_proc_write_sensitivity,
 };
 
-static struct file_operations acx_e_proc_ops[5] ;
+static struct file_operations acx_e_proc_ops[ARRAY_SIZE(proc_files)] ;
+
 #endif
 // -----
 
@@ -1837,14 +1880,15 @@ void acx_set_defaults(acx_device_t * adev)
 	 * NOTE: for some settings, e.g. CCA and ED (ACX100!), an initial
 	 * query is REQUIRED, otherwise the card won't work correctly! */
 	adev->get_mask =
-	    GETSET_ANTENNA | GETSET_SENSITIVITY | GETSET_STATION_ID |
-	    GETSET_REG_DOMAIN;
+	    GETSET_ANTENNA | GETSET_STATION_ID | GETSET_REG_DOMAIN;
 	/* Only ACX100 supports ED and CCA */
 	if (IS_ACX100(adev))
 		adev->get_mask |= GETSET_CCA | GETSET_ED_THRESH;
 
 	// OW FIXME - review locking
 	acx_update_card_settings(adev);
+
+	acx_get_sensitivity(adev);
 
 	/* set our global interrupt mask */
 	if (IS_PCI(adev))
@@ -1910,7 +1954,7 @@ void acx_set_defaults(acx_device_t * adev)
 	adev->rate_bcast = RATE111_1;
 	adev->rate_bcast100 = RATE100_1;
 	adev->rate_basic = RATE111_1 | RATE111_2;
-	adev->rate_auto = 0;
+	adev->rate_auto = 1;
 	if (IS_ACX111(adev)) {
 		adev->rate_oper = RATE111_ALL;
 	} else {
@@ -1939,9 +1983,11 @@ void acx_set_defaults(acx_device_t * adev)
 	}
 
 	/* adev->tx_level_auto = 1; */
+
+	// Sensitivity settings
 	if (IS_ACX111(adev)) {
-		/* start with sensitivity level 1 out of 3: */
-		adev->sensitivity = 1;
+		/* start with sensitivity level 2 out of 3: */
+		adev->sensitivity = 2;
 	}
 
 /* #define ENABLE_POWER_SAVE */
@@ -1974,6 +2020,58 @@ void acx_set_defaults(acx_device_t * adev)
 	acx_initialize_rx_config(adev);
 
 	FN_EXIT0;
+}
+
+static void acx_get_sensitivity(acx_device_t *adev)
+{
+
+	if ( (RADIO_11_RFMD == adev->radio_type) ||
+		 (RADIO_0D_MAXIM_MAX2820	== adev->radio_type) ||
+		 (RADIO_15_RALINK == adev->radio_type))
+	{
+		acx_read_phy_reg(adev, 0x30, &adev->sensitivity);
+	} else {
+		log(L_INIT, "acx: don't know how to get sensitivity "
+				"for radio type 0x%02X\n", adev->radio_type);
+		return;
+	}
+
+	log(L_INIT, "acx: got sensitivity value %u\n", adev->sensitivity);
+}
+
+static void acx_set_sensitivity(acx_device_t *adev, u8 sensitivity)
+{
+	adev->sensitivity = sensitivity;
+	acx_update_sensitivity(adev);
+}
+
+
+static void acx_update_sensitivity(acx_device_t *adev)
+{
+
+	if (IS_USB(adev) && IS_ACX100(adev)){
+		log(L_ANY, "acx: Updating sensitivity on usb acx100 doesn't work yet.\n");
+		return;
+	}
+
+	log(L_INIT, "acx: updating sensitivity value: %u\n",
+			adev->sensitivity);
+	switch (adev->radio_type) {
+	case RADIO_0D_MAXIM_MAX2820:
+	case RADIO_11_RFMD:
+	case RADIO_15_RALINK:
+		acx_write_phy_reg(adev, 0x30, adev->sensitivity);
+		break;
+	case RADIO_16_RADIA_RC2422:
+	case RADIO_17_UNKNOWN:
+		/* TODO: check whether RADIO_1B (ex-Radia!) has same behaviour */
+		acx111_sens_radio_16_17(adev);
+		break;
+	default:
+		log(L_INIT, "acx: don't know how to modify the sensitivity "
+				"for radio type 0x%02X\n", adev->radio_type);
+	}
+
 }
 
 /*
@@ -2029,21 +2127,6 @@ void acx_update_card_settings(acx_device_t *adev)
 		}
 		SET_IEEE80211_PERM_ADDR(adev->ieee,adev->dev_addr);
 		CLEAR_BIT(adev->get_mask, GETSET_STATION_ID);
-	}
-
-	if (adev->get_mask & GETSET_SENSITIVITY) {
-		if ((RADIO_11_RFMD == adev->radio_type)
-		    || (RADIO_0D_MAXIM_MAX2820 == adev->radio_type)
-		    || (RADIO_15_RALINK == adev->radio_type)) {
-			acx_read_phy_reg(adev, 0x30, &adev->sensitivity);
-		} else {
-			log(L_INIT, "acx: don't know how to get sensitivity "
-			    "for radio type 0x%02X\n", adev->radio_type);
-			adev->sensitivity = 0;
-		}
-		log(L_INIT, "acx: got sensitivity value %u\n", adev->sensitivity);
-
-		CLEAR_BIT(adev->get_mask, GETSET_SENSITIVITY);
 	}
 
 	if (adev->get_mask & GETSET_ANTENNA) {
@@ -2198,27 +2281,6 @@ void acx_update_card_settings(acx_device_t *adev)
 		    adev->tx_level_dbm);
 		acx_set_tx_level(adev, adev->tx_level_dbm);
 		CLEAR_BIT(adev->set_mask, GETSET_TXPOWER);
-	}
-
-	if (adev->set_mask & GETSET_SENSITIVITY) {
-		log(L_INIT, "acx: updating sensitivity value: %u\n",
-		    adev->sensitivity);
-		switch (adev->radio_type) {
-		case RADIO_0D_MAXIM_MAX2820:
-		case RADIO_11_RFMD:
-		case RADIO_15_RALINK:
-			acx_write_phy_reg(adev, 0x30, adev->sensitivity);
-			break;
-		case RADIO_16_RADIA_RC2422:
-		case RADIO_17_UNKNOWN:
-		/* TODO: check whether RADIO_1B (ex-Radia!) has same behaviour */
-			acx111_sens_radio_16_17(adev);
-			break;
-		default:
-			log(L_INIT, "acx: don't know how to modify the sensitivity "
-			    "for radio type 0x%02X\n", adev->radio_type);
-		}
-		CLEAR_BIT(adev->set_mask, GETSET_SENSITIVITY);
 	}
 
 	if (adev->set_mask & GETSET_ANTENNA) {
@@ -2504,6 +2566,13 @@ void acx_start(acx_device_t * adev)
 
 	log(L_INIT, "acx: updating initial settings on iface activation\n");
 	acx_update_card_settings(adev);
+
+	// For the acx100, we leave the firmware sensitivity
+	// and it doesn't support auto recalib, so don't set it
+	if (IS_ACX111(adev)) {
+		acx_update_sensitivity(adev);
+		acx111_set_recalib_auto(adev, 1);
+	}
 
 	FN_EXIT0;
 }
@@ -3244,20 +3313,43 @@ acx_s_set_probe_request_template(acx_device_t *adev)
  * ==================================================
  */
 
-static int acx_recalib_radio(acx_device_t *adev) {
+static int acx111_set_recalib_auto(acx_device_t *adev, int enable) {
+	adev->recalib_auto=enable;
+	return(acx111_update_recalib_auto(adev));
+}
 
-	if (IS_ACX111(adev)) {
-		acx111_cmd_radiocalib_t cal;
+static int acx111_update_recalib_auto(acx_device_t *adev) {
 
+	acx111_cmd_radiocalib_t cal;
+
+	if (!IS_ACX111(adev))
+	{
+		log(L_INIT, "acx: Firmware auto radio-recalibration not supported on acx100.\n");
+		return(-1);
+	}
+
+	if (adev->recalib_auto) {
+		log(L_INIT, "acx: Enabling firmware auto radio-recalibration.\n");
 		/* automatic recalibration, choose all methods: */
 		cal.methods = cpu_to_le32(0x8000000f);
 		/* automatic recalibration every 60 seconds (value in TUs)
 		 * I wonder what the firmware default here is? */
 		cal.interval = cpu_to_le32(58594);
-		return acx_issue_cmd_timeo(adev, ACX111_CMD_RADIOCALIB,
-				&cal, sizeof(cal),
-				CMD_TIMEOUT_MS(100));
 	} else {
+		log(L_INIT, "acx: Disabling firmware auto radio-recalibration.\n");
+		cal.methods = 0;
+		cal.interval = 0;
+	}
+
+	return acx_issue_cmd_timeo(adev, ACX111_CMD_RADIOCALIB,
+			&cal, sizeof(cal),
+			CMD_TIMEOUT_MS(100));
+}
+
+static int acx_recalib_radio(acx_device_t *adev) {
+
+	if (IS_ACX100(adev)) {
+		logf0(L_INIT, "acx100: Doing radio re-calibration.\n");
 		/* On ACX100, we need to recalibrate the radio
 		 * by issuing a GETSET_TX|GETSET_RX */
 		if (
@@ -3269,7 +3361,11 @@ static int acx_recalib_radio(acx_device_t *adev) {
 			return OK;
 
 		return NOT_OK;
+	} else {
+		logf0(L_INIT, "acx111: Enabling auto radio re-calibration.\n");
+		 return(acx111_set_recalib_auto(adev, 1));
 	}
+
 }
 
 static void acx_after_interrupt_recalib(acx_device_t * adev)
@@ -3968,7 +4064,6 @@ static ssize_t acx_proc_write_diag(struct file *file, const char __user *buf,
 
 	if (count == size) {
 		ret = count;
-		acx_debug = val;
 	} else {
 		goto exit_unlock;
 	}
@@ -3978,7 +4073,7 @@ static ssize_t acx_proc_write_diag(struct file *file, const char __user *buf,
 	// Execute operation
 	if (val == ACX_DIAG_OP_RECALIB) {
 		logf0(L_ANY, "ACX_DIAG_OP_RECALIB: Scheduling immediate radio recalib\n");
-		adev->recalib_time_last_success =- RECALIB_PAUSE * 60 * HZ;
+		adev->recalib_time_last_success = jiffies - RECALIB_PAUSE * 60 * HZ;
 		acx_schedule_task(adev, ACX_AFTER_IRQ_CMD_RADIO_RECALIB);
 	} else
 	// Execute operation
@@ -4164,6 +4259,55 @@ static ssize_t acx_proc_write_debug(struct file *file, const char __user *buf,
 
 }
 
+static int acx_proc_show_sensitivity(struct seq_file *file, void *v)
+{
+	acx_device_t *adev = (acx_device_t *) file->private;
+
+	FN_ENTER;
+	acx_sem_lock(adev);
+
+	acx_get_sensitivity(adev);
+	seq_printf(file, "acx_sensitivity: %d\n", adev->sensitivity);
+
+	acx_sem_unlock(adev);
+	FN_EXIT0;
+
+	return 0;
+}
+
+static ssize_t acx_proc_write_sensitivity(struct file *file, const char __user *buf,
+				   size_t count, loff_t *ppos)
+{
+	acx_device_t *adev = (acx_device_t *) PDE(file->f_path.dentry->d_inode)->data;
+
+	ssize_t ret = -EINVAL;
+	char *after;
+	unsigned long val;
+	size_t size;
+
+	FN_ENTER;
+	acx_sem_lock(adev);
+
+	val = simple_strtoul(buf, &after, 0);
+	size = after - buf + 1;
+
+	if (count != size)
+		goto out;
+
+	ret = count;
+
+	acx_set_sensitivity(adev, val);
+	logf1(L_ANY, "acx_sensitivity=%d\n", adev->sensitivity);
+
+	out:
+		acx_sem_unlock(adev);
+		FN_EXIT0;
+
+	return ret;
+}
+
+
+
 static int acx_proc_open(struct inode *inode, struct file *file)
 {
 	int i;
@@ -4176,8 +4320,23 @@ static int acx_proc_open(struct inode *inode, struct file *file)
 	return single_open(file, acx_proc_show_funcs[i], PDE(inode)->data);
 }
 
-static int acx_proc_manage_entries(struct ieee80211_hw *hw, int num, int remove)
-{
+static void acx_proc_init(void) {
+
+	int i;
+
+	// acx_e_proc_ops init
+	for (i = 0; i < ARRAY_SIZE(proc_files); i++) {
+		acx_e_proc_ops[i].owner = THIS_MODULE;
+		acx_e_proc_ops[i].open = acx_proc_open;
+		acx_e_proc_ops[i].read = seq_read;
+		acx_e_proc_ops[i].llseek = seq_lseek;
+		acx_e_proc_ops[i].release = single_release;
+		acx_e_proc_ops[i].write = acx_proc_write_funcs[i];
+	}
+
+}
+
+int acx_proc_register_entries(struct ieee80211_hw *hw) {
 	acx_device_t *adev = ieee2adev(hw);
 	char procbuf[80];
 	char procbuf2[80];
@@ -4187,47 +4346,36 @@ static int acx_proc_manage_entries(struct ieee80211_hw *hw, int num, int remove)
 
 	FN_ENTER;
 
-	// Create a subdir for this acx instance
-	snprintf(procbuf2, sizeof(procbuf), "driver/acx%i", num);
 
-	if (!remove) {
+	// Sub-dir for this acx_phy[0-9] instance
 
-		ppe = proc_mkdir(procbuf2, NULL);
+	// I tried to create a /proc/driver/acx sub-dir in acx_proc_init()
+	// to put the phy[0-9] into, but for some bizarre reason the proc-fs
+	// refuses then to create the phy[0-9] dirs in /proc/driver/acx !?
+	// It only works, if /proc/driver/acx is created here in
+	// acx_proc_register_entries().
+	// ... Anyway, we should swap to sysfs.
+	snprintf(procbuf2, sizeof(procbuf2), "driver/acx_%s", wiphy_name(
+			adev->ieee->wiphy));
 
-		for (i = 0; i < ARRAY_SIZE(proc_files); i++) {
-			snprintf(procbuf, sizeof(procbuf), "%s/%s", procbuf2, proc_files[i]);
-			log(L_INIT, "acx: %sing /proc entry %s\n",
-					remove ? "remov" : "creat", procbuf);
+	ppe = proc_mkdir(procbuf2, NULL);
 
-			acx_e_proc_ops[i].owner = THIS_MODULE;
-			acx_e_proc_ops[i].open = acx_proc_open;
-			acx_e_proc_ops[i].read = seq_read;
-			acx_e_proc_ops[i].llseek = seq_lseek;
-			acx_e_proc_ops[i].release = single_release;
-			acx_e_proc_ops[i].write = acx_proc_write_funcs[i];
+	for (i = 0; i < ARRAY_SIZE(proc_files); i++) {
+		snprintf(procbuf, sizeof(procbuf), "%s/%s", procbuf2, proc_files[i]);
+		log(L_INIT, "acx: creating proc entry /proc/%s\n", procbuf);
 
-			// Read-only
-			if (acx_proc_write_funcs[i] == NULL)
-				pe = proc_create(procbuf, 0444, NULL, &acx_e_proc_ops[i]);
-			// Read-Write
-			else
-				pe = proc_create(procbuf, 0644, NULL, &acx_e_proc_ops[i]);
+		// Read-only
+		if (acx_proc_write_funcs[i] == NULL)
+			pe = proc_create(procbuf, 0444, NULL, &acx_e_proc_ops[i]);
+		// Read-Write
+		else
+			pe = proc_create(procbuf, 0644, NULL, &acx_e_proc_ops[i]);
 
-			if (!pe) {
-				printk("acx: cannot register /proc entry %s\n", procbuf);
-				return NOT_OK;
-			}
-			pe->data = adev;
-
+		if (!pe) {
+			printk("acx: cannot register proc entry /proc/%s\n", procbuf);
+			return NOT_OK;
 		}
-
-	} else {
-
-		for (i = 0; i < ARRAY_SIZE(proc_files); i++) {
-			snprintf(procbuf, sizeof(procbuf), "%s/%s", procbuf2, proc_files[i]);
-			remove_proc_entry(procbuf, NULL);
-		}
-		remove_proc_entry(procbuf2, NULL);
+		pe->data = adev;
 
 	}
 
@@ -4235,14 +4383,28 @@ static int acx_proc_manage_entries(struct ieee80211_hw *hw, int num, int remove)
 	return OK;
 }
 
-int acx_proc_register_entries(struct ieee80211_hw *ieee, int num)
+int acx_proc_unregister_entries(struct ieee80211_hw *hw)
 {
-	return acx_proc_manage_entries(ieee, num, 0);
-}
+	acx_device_t *adev = ieee2adev(hw);
+	char procbuf[80];
+	char procbuf2[80];
+	int i;
 
-int acx_proc_unregister_entries(struct ieee80211_hw *ieee, int num)
-{
-	return acx_proc_manage_entries(ieee, num, 1);
+	FN_ENTER;
+
+	// Subdir for this acx instance
+	snprintf(procbuf2, sizeof(procbuf2), "driver/acx_%s", wiphy_name(
+			adev->ieee->wiphy));
+
+	for (i = 0; i < ARRAY_SIZE(proc_files); i++) {
+		snprintf(procbuf, sizeof(procbuf), "%s/%s", procbuf2, proc_files[i]);
+		log(L_INIT, "acx: removing proc entry /proc/%s\n", procbuf);
+		remove_proc_entry(procbuf, NULL);
+	}
+	remove_proc_entry(procbuf2, NULL);
+
+	FN_EXIT0;
+	return OK;
 }
 
 
@@ -4299,10 +4461,10 @@ static void acx_initialize_rx_config(acx_device_t * adev)
 					   /* | RX_CFG1_RCV_MC_ADDR0       */
 					   /* | RX_CFG1_FILTER_ALL_MULTI   */
 					   /* | RX_CFG1_FILTER_BSSID       */
-					   /* | RX_CFG1_FILTER_MAC         */
-					    | RX_CFG1_RCV_PROMISCUOUS
-					   /* | RX_CFG1_INCLUDE_FCS */
-					   /* | RX_CFG1_INCLUDE_PHY_HDR   */
+					   | RX_CFG1_FILTER_MAC
+					   /* | RX_CFG1_RCV_PROMISCUOUS    */
+					   /* | RX_CFG1_INCLUDE_FCS        */
+					   /* | RX_CFG1_INCLUDE_PHY_HDR    */
 		    );
 		adev->rx_config_2 = (u16) (0
 					   | RX_CFG2_RCV_ASSOC_REQ
@@ -4715,9 +4877,82 @@ static void acx_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
 	return;
 }
 
+u16 acx111_tx_build_rateset(acx_device_t *adev, txdesc_t *txdesc,
+		struct ieee80211_tx_info *info) {
+
+	int i;
+
+	char tmpstr[256];
+	struct ieee80211_rate *tmpbitrate;
+	int tmpcount;
+
+	u16 rateset = 0;
+
+	int debug = acx_debug & L_BUFT;
+
+	if (debug) {
+		i = ((u8*) txdesc - (u8*) adev->txdesc_start) / adev->txdesc_size;
+		sprintf(tmpstr, "txdesc=%i: rates in info [bitrate,hw_value,count]: ",
+				i);
+	}
+
+	for (i = 0; i < IEEE80211_TX_MAX_RATES; i++) {
+		if (info->control.rates[i].idx < 0)
+			break;
+
+		tmpbitrate
+				= &adev->ieee->wiphy->bands[info->band]->bitrates[info->control.rates[i].idx];
+		tmpcount = info->control.rates[i].count;
+
+		rateset |= tmpbitrate->hw_value;
+
+		if (debug) {
+			sprintf(tmpstr + strlen(tmpstr), "%i=[%i,0x%04X,%i]%s", i,
+					tmpbitrate->bitrate, tmpbitrate->hw_value, tmpcount, (i
+							< IEEE80211_TX_MAX_RATES - 1) ? ", " : "");
+		}
+	}
+
+	if (debug)
+		logf1(L_ANY, "%s: rateset=0x%04X\n", tmpstr, rateset);
+
+	return (rateset);
+}
+
+void acx111_tx_build_txstatus(acx_device_t *adev,
+		struct ieee80211_tx_info *txstatus, u16 r111, u8 ack_failures) {
+
+	u16 rate_hwvalue;
+	u16 rate_bitrate;
+	int rate_index;
+	int j;
+
+	rate_hwvalue = 1 << highest_bit(r111 & RATE111_ALL);
+	rate_index = acx_rate111_hwvalue_to_rateindex(rate_hwvalue);
+
+	for (j = 0; j < IEEE80211_TX_MAX_RATES; j++) {
+		if (txstatus->status.rates[j].idx == rate_index) {
+			txstatus->status.rates[j].count = ack_failures + 1;
+			break;
+		}
+	}
+
+	if ((acx_debug & L_BUFT) && (ack_failures > 0)) {
+		rate_bitrate = acx_rate111_hwvalue_to_bitrate(rate_hwvalue);
+
+		logf1(L_ANY,
+				"sentrate(bitrate,hw_value)=(%d,0x%04X) status.rates[%d].count=%d\n",
+				rate_bitrate, rate_hwvalue,
+				j, (j<IEEE80211_TX_MAX_RATES) ? txstatus->status.rates[j].count : -1);
+	}
+
+}
+
 void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger,
 		struct ieee80211_tx_info *info)
 {
+	int log_level = L_INIT;
+
 	const char *err = "unknown error";
 
 	/* hmm, should we handle this as a mask
@@ -4746,11 +4981,13 @@ void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger
 		    "'iwconfig retry lifetime XXX'";
 /*		adev->wstats.discard.misc++; */
 		break;
+
 	case 0x20:
 		err = "excessive Tx retries due to either distance "
 		    "too high or unable to Tx or Tx frame error - "
 		    "try changing 'iwconfig txpower XXX' or "
 		    "'sens'itivity or 'retry'";
+		log_level = acx_debug & L_DEBUG;
 /*		adev->wstats.discard.retries++; */
 		/* Tx error 0x20 also seems to occur on
 		 * overheating, so I'm not sure whether we
@@ -4768,7 +5005,8 @@ void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger
 		 * --> less heat?) or 802.11 power save mode?
 		 *
 		 * ok, just do it. */
-		if (++adev->retry_errors_msg_ratelimit % 4 == 0) {
+		if ((++adev->retry_errors_msg_ratelimit % 4 == 0)) {
+
 			if (adev->retry_errors_msg_ratelimit <= 20) {
 
 				logf1(L_DEBUG, "%s: several excessive Tx "
@@ -4779,13 +5017,17 @@ void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger
 				       "before it's too late!\n",
 				       wiphy_name(adev->ieee->wiphy));
 
-				logf0(L_ANY, "Scheduling radio recalibration after high tx retries\n");
 				if (adev->retry_errors_msg_ratelimit == 20)
-					logf0(L_ANY, "Disabling above message\n");
+					logf0(L_DEBUG, "Disabling above message\n");
 			}
 
-			acx_schedule_task(adev,
+			// On the acx111, we would normally have auto radio-recalibration enabled
+			if (!adev->recalib_auto){
+				logf0(L_ANY, "Scheduling radio recalibration after high tx retries.\n");
+				acx_schedule_task(adev,
 					  ACX_AFTER_IRQ_CMD_RADIO_RECALIB);
+			}
+
 		}
 
 		break;
@@ -4810,17 +5052,12 @@ void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger
 
 	adev->stats.tx_errors++;
 
-	switch (error) {
-	// Report an tx-error 0x20 in L_DEBUG only
-	case 0x20:
-		if (!(acx_debug & L_DEBUG))
-			break;
-
-	default:
-		if (adev->stats.tx_errors <= 20)
-			printk("acx: %s: tx error 0x%02X, buf %02u! (%s)\n", wiphy_name(
-					adev->ieee->wiphy), error, finger, err);
-	}
+	if (adev->stats.tx_errors <= 20)
+		log(log_level, "acx: %s: tx error 0x%02X, buf %02u! (%s)\n", wiphy_name(
+			adev->ieee->wiphy), error, finger, err);
+	else
+		log(log_level, "acx: %s: tx error 0x%02X, buf %02u!\n", wiphy_name(
+			adev->ieee->wiphy), error, finger);
 
 }
 
@@ -6144,6 +6381,9 @@ static int __init acx_init_module(void)
 		printk ("acx: r1_pci=%i, r2_usb=%i, r3_mem=%i\n", r1, r2, r3);
 		return -EINVAL;
 	}
+
+	// Init acx_e_proc_ops
+	acx_proc_init();
 
 	/* return success if at least one succeeded */
 	return 0;

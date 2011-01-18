@@ -686,10 +686,10 @@ acxusb_issue_cmd_timeo_debug(acx_device_t * adev,
 
 	cmd_status = le16_to_cpu(loc->status);
 	if (cmd_status != 1) {
-		printk("acx: %s: %s: cmd_status is not SUCCESS: %d (%s)\n",
-		       __func__, devname,
+		printk("acx: %s: %s: cmd %s is not SUCCESS: %d (%s)\n",
+		       __func__, devname, cmdstr,
 		       cmd_status, acx_cmd_status_str(cmd_status));
-		/* TODO: goto bad; ? */
+		goto bad;
 	}
 	if ((cmd == ACX1xx_CMD_INTERROGATE) && buffer && buflen) {
 		memcpy(buffer, loc->data, buflen);
@@ -705,8 +705,6 @@ acxusb_issue_cmd_timeo_debug(acx_device_t * adev,
   bad:
 	/* Give enough info so that callers can avoid
 	 ** printing their own diagnostic messages */
-
-	printk("acx: %s: %s: cmd=%s: FAILED\n", __func__, devname, cmdstr);
 
 	//dump_stack();
 	kfree(loc);
@@ -1441,8 +1439,20 @@ static int acxusb_op_start(struct ieee80211_hw *hw)
 
 	adev->initialized = 0;
 
+	/* Reset URBs status */
+	for (i = 0; i < ACX_RX_URB_CNT; i++) {
+		adev->usb_rx[i].urb->status = 0;
+		adev->usb_rx[i].busy = 0;
+	}
+
+	for (i = 0; i < ACX_TX_URB_CNT; i++) {
+		adev->usb_tx[i].urb->status = 0;
+		adev->usb_tx[i].busy = 0;
+	}
+	adev->tx_free = ACX_TX_URB_CNT;
+
 	/* put the ACX100 out of sleep mode */
-	//	acx_s_issue_cmd(adev, ACX1xx_CMD_WAKE, NULL, 0);
+	acx_issue_cmd(adev, ACX1xx_CMD_WAKE, NULL, 0);
 
 	init_timer(&adev->mgmt_timer);
 	adev->mgmt_timer.function = acx_timer;
@@ -1452,11 +1462,6 @@ static int acxusb_op_start(struct ieee80211_hw *hw)
 	SET_BIT(adev->dev_state_mask, ACX_STATE_IFACE_UP);
 	acx_start(adev);
 
-	/* don't acx_start_queue() here, we need to associate first */
-
-	for (i = 0; i < ACX_RX_URB_CNT; i++) {
-		adev->usb_rx[i].urb->status = 0;
-	}
 	acxusb_poll_rx(adev, &adev->usb_rx[0]);
 
 	acx_wake_queue(adev->ieee, NULL);
@@ -1844,7 +1849,7 @@ acxusb_probe(struct usb_interface *intf, const struct usb_device_id *devID)
 		goto end_nomem;
 	}
 
-	acx_proc_register_entries(ieee, 0);
+	acx_proc_register_entries(ieee);
 
 	printk("acx: USB module loaded successfully\n");
 
@@ -1914,7 +1919,7 @@ static void acxusb_disconnect(struct usb_interface *intf)
 	 * _close() will try to grab it as well if it's called,
 	 * deadlocking the machine.
 	 */
-	acx_proc_unregister_entries(adev->ieee, 0);
+	acx_proc_unregister_entries(adev->ieee);
 	ieee80211_unregister_hw(adev->ieee);
 
 	acx_sem_lock(adev);

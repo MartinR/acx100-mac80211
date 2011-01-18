@@ -131,8 +131,8 @@ static void acxpci_process_rxdesc(acx_device_t * adev);
 // Tx Path
 tx_t *acxpci_alloc_tx(acx_device_t * adev);
 void *acxpci_get_txbuf(acx_device_t * adev, tx_t * tx_opaque);
-void acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
-unsigned int acxpci_clean_txdesc(acx_device_t * adev);
+void acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_info *info, struct sk_buff *skb);
+unsigned int acxpci_tx_clean_txdesc(acx_device_t * adev);
 void acxpci_clean_txdesc_emergency(acx_device_t * adev);
 static inline txdesc_t *acxpci_get_txdesc(acx_device_t * adev, int index);
 static inline txdesc_t *acxpci_advance_txdesc(acx_device_t * adev, txdesc_t * txdesc, int inc);
@@ -272,11 +272,11 @@ static void acxpci_log_txbuffer(acx_device_t * adev)
  * ==================================================
  */
 
-/* OS I/O routines *always* be endianness-clean but having them doesn't hurt */
-#define acx_readl(v)	le32_to_cpu(readl((v)))
-#define acx_readw(v)	le16_to_cpu(readw((v)))
-#define acx_writew(v,r)	writew(le16_to_cpu((v)), r)
-#define acx_writel(v,r)	writel(le32_to_cpu((v)), r)
+/* Endianess: read[lw], write[lw] do little-endian conversion internally */
+#define acx_readl(v)	readl((v))
+#define acx_readw(v)	readw((v))
+#define acx_writel(v,r)	writel((v), r)
+#define acx_writew(v,r)	writew((v), r)
 
 INLINE_IO u32 read_reg32(acx_device_t * adev, unsigned int offset)
 {
@@ -2087,7 +2087,6 @@ void *acxpci_get_txbuf(acx_device_t * adev, tx_t * tx_opaque)
 	return acxpci_get_txhostdesc(adev, (txdesc_t *) tx_opaque)->data;
 }
 
-
 /*
  * acxpci_l_tx_data
  *
@@ -2100,16 +2099,14 @@ void *acxpci_get_txbuf(acx_device_t * adev, tx_t * tx_opaque)
  */
 void
 acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
-		 struct ieee80211_tx_info *ieeectl,struct sk_buff *skb)
+		 struct ieee80211_tx_info *info, struct sk_buff *skb)
 {
 	txdesc_t *txdesc = (txdesc_t *) tx_opaque;
 	struct ieee80211_hdr *wireless_header;
 	txhostdesc_t *hostdesc1, *hostdesc2;
-	int rate;
+	u16 rateset;
 	u8 Ctl_8, Ctl2_8;
 	int wlhdr_len;
-
-	int bitrate;
 
 	FN_ENTER;
 
@@ -2132,6 +2129,9 @@ acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
 
 	hostdesc2 = hostdesc1 + 1;
 
+	txdesc->total_length = cpu_to_le16(len);
+	hostdesc2->length = cpu_to_le16(len - wlhdr_len);
+
 	/* DON'T simply set Ctl field to 0 here globally,
 	 * it needs to maintain a consistent flag status (those are state flags!!),
 	 * otherwise it may lead to severe disruption. Only set or reset particular
@@ -2139,7 +2139,7 @@ acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
 
 	/* let chip do RTS/CTS handshaking before sending
 	 * in case packet size exceeds threshold */
-	if (ieeectl->flags & IEEE80211_TX_RC_USE_RTS_CTS)
+	if (info->flags & IEEE80211_TX_RC_USE_RTS_CTS)
 	{
 		SET_BIT(Ctl2_8, DESC_CTL2_RTS);
 	}
@@ -2147,19 +2147,15 @@ acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
 		CLEAR_BIT(Ctl2_8, DESC_CTL2_RTS);
 	}
 
-	bitrate = ieee80211_get_tx_rate(adev->ieee, ieeectl)->bitrate;
-	rate = ieee80211_get_tx_rate(adev->ieee, ieeectl)->hw_value;
-
-//	logf1(L_ANY, "bitrate=%i, rate(hw_value)=%04X\n", bitrate, rate)
-
-	txdesc->total_length = cpu_to_le16(len);
-	hostdesc2->length = cpu_to_le16(len - wlhdr_len);
-
 	/* ACX111 */
 	if (IS_ACX111(adev)) {
+
+		// Build rateset for acx111
+		rateset=acx111_tx_build_rateset(adev, txdesc, info);
+
 		/* note that if !txdesc->do_auto, txrate->cur
 		 ** has only one nonzero bit */
-		txdesc->u.r2.rate111 = cpu_to_le16(rate);
+		txdesc->u.r2.rate111 = cpu_to_le16(rateset);
 		
 		/* WARNING: I was never able to make it work with prism54 AP.
 		 * It was falling down to 1Mbit where shortpre is not applicable,
@@ -2176,7 +2172,12 @@ acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
 	}
 	/* ACX100 */
 	else {
-		txdesc->u.r1.rate = rate;
+
+		// Get rate for acx100, single rate only for acx100
+		rateset = ieee80211_get_tx_rate(adev->ieee, info)->hw_value;
+		logf1(L_BUFT, "rateset=%u\n", rateset)
+
+		txdesc->u.r1.rate = (u8) rateset;
 
 #ifdef TODO_FIGURE_OUT_WHEN_TO_SET_THIS
 		if (clt->pbcc511) {
@@ -2261,7 +2262,7 @@ acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
  * in filling new txdescs.
  * Everytime we get called we know where the next packet to be cleaned is.
  */
-unsigned int acxpci_clean_txdesc(acx_device_t * adev)
+unsigned int acxpci_tx_clean_txdesc(acx_device_t * adev)
 {
 	txdesc_t *txdesc;
 	txhostdesc_t *hostdesc;
@@ -2270,6 +2271,7 @@ unsigned int acxpci_clean_txdesc(acx_device_t * adev)
 	u16 r111;
 	u8 error, ack_failures, rts_failures, rts_ok, r100;
 	struct ieee80211_tx_info *txstatus;
+
 
 	FN_ENTER;
 
@@ -2313,6 +2315,11 @@ unsigned int acxpci_clean_txdesc(acx_device_t * adev)
 		r100 = txdesc->u.r1.rate;
 		r111 = le16_to_cpu(txdesc->u.r2.rate111);
 
+		if ((acx_debug & L_BUFT) && (ack_failures > 0))
+			log(L_ANY,
+					"acx: tx: cleaned %u: !ACK=%u !RTS=%u RTS=%u r100=%u r111=%04X tx_free=%u\n",
+					finger, ack_failures, rts_failures, rts_ok, r100, r111, adev->tx_free);
+
 		// OW TODO 20091116 Compare mem.c
 		/* need to check for certain error conditions before we
 		 * clean the descriptor: we still need valid descr data here */
@@ -2322,7 +2329,11 @@ unsigned int acxpci_clean_txdesc(acx_device_t * adev)
         if (!(txstatus->flags & IEEE80211_TX_CTL_NO_ACK) && !(error & 0x30))
 			txstatus->flags |= IEEE80211_TX_STAT_ACK;
 
-    	txstatus->status.rates[0].count = ack_failures + 1;
+    	if (IS_ACX111(adev)) {
+			acx111_tx_build_txstatus(adev, txstatus, r111, ack_failures);
+		} else {
+			txstatus->status.rates[0].count = ack_failures + 1;
+		}
 
 		/* ...and free the desc */
 		txdesc->error = 0;
@@ -2340,15 +2351,6 @@ unsigned int acxpci_clean_txdesc(acx_device_t * adev)
 		 * AFTER having done the work, it's faster */
 		if (unlikely(error))
 			acxpcimem_handle_tx_error(adev, error, finger,  txstatus);
-
-		if (IS_ACX111(adev))
-			log(L_BUFT,
-			    "acx: tx: cleaned %u: !ACK=%u !RTS=%u RTS=%u r111=%04X tx_free=%u\n",
-			    finger, ack_failures, rts_failures, rts_ok, r111, adev->tx_free);
-		else
-			log(L_BUFT,
-			    "acx: tx: cleaned %u: !ACK=%u !RTS=%u RTS=%u rate=%u\n",
-			    finger, ack_failures, rts_failures, rts_ok, r100);
 
 		/* And finally report upstream */
 		ieee80211_tx_status(adev->ieee, hostdesc->skb);
@@ -2577,7 +2579,7 @@ void acxpci_irq_work(struct work_struct *work)
 			 * directly on the tx status resolved this problem.
 			 * Now WPA assoc succeeds directly and robust.			 			 			 			 
 			 */			 
-			acxpci_clean_txdesc(adev);
+			acxpci_tx_clean_txdesc(adev);
 
 			// Restart queue if stopped and enough tx-descr free
 			if ((adev->tx_free >= TX_START_QUEUE) && acx_queue_stopped(
@@ -3632,7 +3634,7 @@ acxpci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * since otherwise an ioctl could step on our feet due to
 	 * firmware operations happening in parallel or uninitialized data */
 
-	if (acx_proc_register_entries(ieee, 0) != OK)
+	if (acx_proc_register_entries(ieee) != OK)
 		goto fail_proc_register_entries;
 
 	printk("acx: net device %s, driver compiled "
@@ -3681,7 +3683,7 @@ acxpci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	// acx_proc_register_entries(ieee, 0)
 	fail_proc_register_entries:
-		acx_proc_unregister_entries(ieee, 0);
+		acx_proc_unregister_entries(ieee);
 
 	// acxpci_read_eeprom_byte(adev, 0x05, &adev->eeprom_version)
 	fail_read_eeprom_byte:
@@ -3799,7 +3801,7 @@ static void __devexit acxpci_remove(struct pci_dev *pdev)
 	}
 
 	// Proc
-	acx_proc_unregister_entries(adev->ieee, 0);
+	acx_proc_unregister_entries(adev->ieee);
 
 	// IRQs
 	acxpci_irq_disable(adev);
@@ -4231,7 +4233,7 @@ static __devinit int vlynq_probe(struct vlynq_device *vdev,
 	 * since otherwise an ioctl could step on our feet due to
 	 * firmware operations happening in parallel or uninitialized data */
 
-	if (acx_proc_register_entries(ieee, 0) != OK)
+	if (acx_proc_register_entries(ieee) != OK)
 		goto fail_vlynq_proc_register_entries;
 
 	/* Now we have our device, so make sure the kernel doesn't try
@@ -4274,7 +4276,7 @@ static __devinit int vlynq_probe(struct vlynq_device *vdev,
 	fail_vlynq_setup_modes:
 
 	fail_vlynq_proc_register_entries:
-		acx_proc_unregister_entries(ieee, 0);
+		acx_proc_unregister_entries(ieee);
 
     fail_vlynq_read_eeprom_version:
 
@@ -4343,7 +4345,7 @@ static void vlynq_remove(struct vlynq_device *vdev)
 	}
 
 	// Proc
-	acx_proc_unregister_entries(adev->ieee, 0);
+	acx_proc_unregister_entries(adev->ieee);
 
 	// IRQs
 	acxpci_irq_disable(adev);

@@ -297,8 +297,8 @@ int acx_selectchannel(acx_device_t *adev, u8 channel, int freq);
 // BOM Proc, Debug (Common)
 // -----
 #ifdef CONFIG_PROC_FS
-int acx_proc_register_entries(struct ieee80211_hw *ieee, int num);
-int acx_proc_unregister_entries(struct ieee80211_hw *ieee, int num);
+int acx_proc_register_entries(struct ieee80211_hw *ieee);
+int acx_proc_unregister_entries(struct ieee80211_hw *ieee);
 #else
 static inline int
 acx_proc_register_entries(const struct ieee80211_hw *ieee) { return OK; }
@@ -323,6 +323,10 @@ int acx_queue_stopped(struct ieee80211_hw *ieee);
 void acx_wake_queue(struct ieee80211_hw *hw, const char *msg);
 tx_t* acx_alloc_tx(acx_device_t *adev, unsigned int len);
 void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger, struct ieee80211_tx_info *info);
+u16 acx111_tx_build_rateset(acx_device_t *adev, txdesc_t *txdesc, struct ieee80211_tx_info *info);
+void acx111_tx_build_txstatus(acx_device_t *adev,	struct ieee80211_tx_info *txstatus, u16 r111, u8 ack_failures);
+u16 acx_rate111_hwvalue_to_bitrate(u16 hw_value);
+int acx_rate111_hwvalue_to_rateindex(u16 hw_value);
 
 //void acx_l_handle_txrate_auto(acx_device_t *adev, struct client *txc,
 //		u16 intended_rate, u8 rate100, u16 rate111, u8 error,
@@ -549,7 +553,7 @@ int acxpci_proc_eeprom_output(char *buf, acx_device_t * adev);
 tx_t *acxpci_alloc_tx(acx_device_t * adev);
 void *acxpci_get_txbuf(acx_device_t * adev, tx_t * tx_opaque);
 void acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
-unsigned int acxpci_clean_txdesc(acx_device_t * adev);
+unsigned int acxpci_tx_clean_txdesc(acx_device_t * adev);
 void acxpci_clean_txdesc_emergency(acx_device_t * adev);
 int acx100pci_set_tx_level(acx_device_t * adev, u8 level_dbm);
 
@@ -652,7 +656,7 @@ void *acxmem_get_txbuf(acx_device_t *adev, tx_t *tx_opaque);
 void acxmem_init_acx_txbuf2(acx_device_t *adev);
 
 void acxmem_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
-unsigned int acxmem_clean_txdesc(acx_device_t *adev);
+unsigned int acxmem_tx_clean_txdesc(acx_device_t *adev);
 void acxmem_clean_txdesc_emergency(acx_device_t *adev);
 
 void acxmem_update_queue_indicator(acx_device_t *adev, int txqueue);

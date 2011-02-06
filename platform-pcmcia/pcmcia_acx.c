@@ -61,11 +61,6 @@ static int __init pcmcia_wlan_init(void)
 	int res;
 	printk(KERN_INFO "pcmcia_wlan_init: acx-mem platform_device_register\n");
 	res = platform_device_register(&acx_device);
-	if (acx_device.dev.driver == NULL) {
-		printk(KERN_ERR "%s: acx-mem driver is not loaded\n", __func__);
-		platform_device_unregister(&acx_device);
-		return -EINVAL;
-	}
 
 	if (res != 0) {
 		printk(KERN_ERR "%s: acx-mem platform_device_register: failed\n",
@@ -194,8 +189,6 @@ static struct pcmcia_driver acx_driver = {
 	.probe		= acx_cs_probe,
 	.remove		= acx_cs_detach,
 	.id_table 	= acx_ids,
-//<---->.suspend<------>= acx_cs_suspend,
-//<---->.resume><------>= acx_cs_resume,
 };
 
 static int __init acx_cs_init(void)
